@@ -10,7 +10,7 @@ app.use(cors({ origin: false }));
 app.use(express.json({ limit: "8kb" }));
 
 const SECRET = process.env.JWT_SECRET;
-const MODEL = "claude-opus-4-8"; // swap to "claude-haiku-4-5" to cut cost on these simple tasks
+const MODEL = "claude-haiku-4-5"; // fast + ~10-20x cheaper than Opus; plenty for these short structured tasks
 const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
 
 // Per-install token: the app calls /register once and stores the token in the Keychain.
