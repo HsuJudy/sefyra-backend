@@ -4,6 +4,7 @@ import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import { randomUUID } from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
+import { Store } from "./store.js";
 
 const app = express();
 app.use(cors({ origin: false }));
@@ -16,8 +17,10 @@ const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from the environme
 // Per-install token: the app calls /register once and stores the token in the Keychain.
 const registerLimiter = rateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 5 });
 app.post("/register", registerLimiter, (_req, res) => {
-  const token = jwt.sign({ id: randomUUID() }, SECRET, { expiresIn: "365d" });
-  res.json({ token });
+  const id = randomUUID();
+  const token = jwt.sign({ id }, SECRET, { expiresIn: "365d" });
+  const inst = Store.ensure(id);
+  res.json({ token, code: inst.code }); // code = this install's referral code
 });
 
 function auth(req, res, next) {
@@ -30,6 +33,18 @@ function auth(req, res, next) {
 // Per-install rate limit so a leaked token can't drain your key.
 const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, keyGenerator: (req) => req.install?.id || req.ip });
 
+// --- Referrals + freemium quota ---
+
+// This install's code, referral count, and remaining monthly AI allowance.
+app.get("/me", auth, (req, res) => res.json(Store.status(req.install.id)));
+
+// Friend enters a referrer's code — both get a bigger monthly allowance.
+app.post("/referral/claim", auth, (req, res) => {
+  const r = Store.claim(req.install.id, req.body.code);
+  if (!r.ok) return res.status(400).json(r);
+  res.json(r);
+});
+
 async function claude(system, prompt) {
   const msg = await anthropic.messages.create({
     model: MODEL,
@@ -40,7 +55,15 @@ async function claude(system, prompt) {
   return (msg.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
 }
 
+// Charge one AI credit; return a 402 with the balance when the monthly free tier is spent.
+function charge(req, res) {
+  const q = Store.tryConsume(req.install.id);
+  if (!q.ok) { res.status(402).json({ error: "quota", ...q }); return null; }
+  return q;
+}
+
 app.post("/api/suggest", auth, aiLimiter, async (req, res) => {
+  const q = charge(req, res); if (!q) return;
   try {
     const item = String(req.body.item || "").slice(0, 500);
     const out = await claude(
@@ -48,11 +71,12 @@ app.post("/api/suggest", auth, aiLimiter, async (req, res) => {
       `Inbox item: "${item}"`
     );
     const first = (out.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "");
-    res.json({ nextAction: first.replace(/^["']|["']$/g, "") });
-  } catch { res.status(500).json({ error: "ai_failed" }); }
+    res.json({ nextAction: first.replace(/^["']|["']$/g, ""), remaining: q.remaining });
+  } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
 });
 
 app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
+  const q = charge(req, res); if (!q) return;
   try {
     const outcome = String(req.body.outcome || "").slice(0, 500);
     const raw = await claude(
@@ -68,10 +92,13 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
         .filter((s) => s && s.length < 120 && !/^(i |i'|that |if |however|note|here|sorry|while|based)/i.test(s));
     }
     steps = steps.map((s) => String(s).trim()).filter(Boolean).slice(0, 6);
-    res.json({ steps });
-  } catch { res.status(500).json({ error: "ai_failed" }); }
+    res.json({ steps, remaining: q.remaining });
+  } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
 });
 
 app.get("/", (_req, res) => res.json({ ok: true })); // health check for the host
+
+// Persist immediately on shutdown (Railway sends SIGTERM on redeploy) so no credits are lost.
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { Store.flush(); process.exit(0); });
 
 app.listen(process.env.PORT || 3000, () => console.log("GTD AI backend up"));
