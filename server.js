@@ -11,18 +11,8 @@ app.use(cors({ origin: false }));
 app.use(express.json({ limit: "8kb" }));
 
 const SECRET = process.env.JWT_SECRET;
+const MODEL = "claude-haiku-4-5"; // fast + ~10-20x cheaper than Opus; plenty for these short structured tasks
 const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
-
-// Model per route: /suggest is a one-line rephrase, /breakdown is the feature people came for.
-// At ~110 in / ~80 out per call the price gap is ~0.7c per user-month at the free quota — the
-// reasoning is worth more than the pennies on breakdown, and worth nothing on suggest.
-const MODEL_SUGGEST = "claude-haiku-4-5";
-const MODEL_BREAKDOWN = "claude-sonnet-5";
-const MAX_TOKENS = 400; // real outputs are ~80 tokens; this only bounds a runaway
-
-// Agent Dispatch uses a strong model with web search — quality matters and it's personal use.
-const MODEL_DISPATCH = "claude-opus-5";
-const DISPATCH_MAX_TOKENS = 8000; // room for research + a full ready-to-use draft per turn
 
 // Per-install token: the app calls /register once and stores the token in the Keychain.
 const registerLimiter = rateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 5 });
@@ -55,36 +45,15 @@ app.post("/referral/claim", auth, (req, res) => {
   res.json(r);
 });
 
-/**
- * Ask Claude for a value matching `schema`. Structured outputs make the shape a
- * hard guarantee, so the reply is always parseable — no prose to scrape, and the
- * model can't hedge its way into the response body.
- */
-async function claudeJSON({ model, system, prompt, schema }) {
+async function claude(system, prompt) {
   const msg = await anthropic.messages.create({
-    model,
-    max_tokens: MAX_TOKENS,
+    model: MODEL,
+    max_tokens: 1000,
     system,
     messages: [{ role: "user", content: prompt }],
-    output_config: { format: { type: "json_schema", schema } },
   });
-  const text = (msg.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
-  return JSON.parse(text);
+  return (msg.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
 }
-
-const SUGGEST_SCHEMA = {
-  type: "object",
-  properties: { nextAction: { type: "string" } },
-  required: ["nextAction"],
-  additionalProperties: false,
-};
-
-const BREAKDOWN_SCHEMA = {
-  type: "object",
-  properties: { steps: { type: "array", items: { type: "string" } } },
-  required: ["steps"],
-  additionalProperties: false,
-};
 
 // Charge one AI credit; return a 402 with the balance when the monthly free tier is spent.
 function charge(req, res) {
@@ -97,14 +66,12 @@ app.post("/api/suggest", auth, aiLimiter, async (req, res) => {
   const q = charge(req, res); if (!q) return;
   try {
     const item = String(req.body.item || "").slice(0, 500);
-    const { nextAction } = await claudeJSON({
-      model: MODEL_SUGGEST,
-      system:
-        "You are a next-action engine. Given an inbox item, return the single most concrete, physical, visible next action that moves it forward — an imperative phrase starting with a verb, max 12 words. Always answer; never refuse or add caveats.",
-      prompt: `Inbox item: "${item}"`,
-      schema: SUGGEST_SCHEMA,
-    });
-    res.json({ nextAction: String(nextAction || "").trim(), remaining: q.remaining });
+    const out = await claude(
+      "You are a GTD next-action engine. Given an inbox item, reply with ONLY the single most concrete, physical, visible next action to move it forward — an imperative phrase starting with a verb, max 12 words. No preamble, no quotes, no explanation. Always answer; never refuse or add caveats.",
+      `Inbox item: "${item}"`
+    );
+    const first = (out.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "");
+    res.json({ nextAction: first.replace(/^["']|["']$/g, ""), remaining: q.remaining });
   } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
 });
 
@@ -112,84 +79,21 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
   const q = charge(req, res); if (!q) return;
   try {
     const outcome = String(req.body.outcome || "").slice(0, 500);
-    const out = await claudeJSON({
-      model: MODEL_BREAKDOWN,
-      system:
-        "You break a project outcome into its next actions. Return 3 to 6 short steps in the order they should happen. Each step is an imperative phrase starting with a verb — something the person could physically start. Always produce steps; if the outcome is vague, make reasonable assumptions rather than asking for detail.",
-      prompt: `Project outcome: "${outcome}"`,
-      schema: BREAKDOWN_SCHEMA,
-    });
-    // The schema guarantees an array of strings; cap the count (JSON Schema can't).
-    const steps = (out.steps || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 6);
+    const raw = await claude(
+      "You are a task-breakdown engine for a GTD app. Given a project outcome, output ONLY a JSON array of 3 to 6 short next-action steps in order. Each step is an imperative phrase starting with a verb. No prose, no preamble, no explanation, no markdown fences, no caveats. Always produce steps — if the outcome is vague, make reasonable assumptions. Never refuse.",
+      `Project outcome: "${outcome}"`
+    );
+    let steps = [];
+    const m = raw.match(/\[[\s\S]*\]/);                       // pull the JSON array even if wrapped in prose
+    if (m) { try { steps = JSON.parse(m[0]); } catch {} }
+    if (!Array.isArray(steps) || !steps.length) {             // last resort: salvage step-like lines, drop prose
+      steps = raw.split("\n")
+        .map((s) => s.replace(/^[\s\-*\d.)\]\["]+/, "").trim())
+        .filter((s) => s && s.length < 120 && !/^(i |i'|that |if |however|note|here|sorry|while|based)/i.test(s));
+    }
+    steps = steps.map((s) => String(s).trim()).filter(Boolean).slice(0, 6);
     res.json({ steps, remaining: q.remaining });
   } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
-});
-
-// --- Agent Dispatch (async: tap a task, an agent researches/drafts the doable part) ---
-//
-// Agent runs take 20–60s+ (a web-search tool-use loop), longer than an HTTP timeout, so we
-// don't hold the request open. POST creates a job and returns a jobId immediately; the agent
-// runs in the background; GET polls the job. NOTE: this Map is in-memory — it resets on every
-// redeploy (Railway sends SIGTERM). Fine for personal v1; a client polling across a redeploy
-// just sees a 404 and can retry.
-const jobs = new Map(); // jobId -> { status: "working"|"done"|"error", result?, error? }
-
-const DISPATCH_SYSTEM =
-  "You are a task-execution agent inside a GTD app. Given a task, do the doable part — " +
-  "research, find, or draft — and return a finished, ready-to-use result the user can act on " +
-  "in one step. Use web search when it makes the result more accurate or current. You MUST NOT " +
-  "claim to have performed any real-world action (sending, posting, buying, booking, submitting, " +
-  "paying) — you cannot take those actions. Instead, produce the finished draft or research " +
-  "result the human will act on manually. Be concise and immediately usable: lead with the " +
-  "deliverable (the draft text, the answer, the shortlist), not a description of what you did.";
-
-// Anthropic's built-in server-side web search tool (read-only; runs on Anthropic's infra).
-const DISPATCH_TOOLS = [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }];
-
-// Run the agent to completion: a server-tool loop. web_search runs server-side, so the only
-// looping we do client-side is to resume a `pause_turn` (the API's server loop hitting its
-// per-turn iteration cap). We collect the final assistant text when the turn ends.
-async function runDispatchAgent(task) {
-  const messages = [{ role: "user", content: `Task: ${task}` }];
-  let text = "";
-  for (let i = 0; i < 12; i++) { // bound continuations so a stuck run can't loop forever
-    const resp = await anthropic.messages.create({
-      model: MODEL_DISPATCH,
-      max_tokens: DISPATCH_MAX_TOKENS,
-      system: DISPATCH_SYSTEM,
-      tools: DISPATCH_TOOLS,
-      messages,
-    });
-    if (resp.stop_reason === "pause_turn") {
-      // Server hit its iteration cap mid-turn — echo the assistant turn back to resume.
-      messages.push({ role: "assistant", content: resp.content });
-      continue;
-    }
-    text = (resp.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-    break;
-  }
-  return text;
-}
-
-// Modest per-install rate limit — dispatch is expensive, so cap it below the other AI routes.
-const dispatchLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, keyGenerator: (req) => req.install?.id || req.ip });
-
-app.post("/api/dispatch", auth, dispatchLimiter, (req, res) => {
-  const task = String(req.body.task || "").slice(0, 1000).trim();
-  if (!task) return res.status(400).json({ error: "task_required" });
-  const jobId = randomUUID();
-  jobs.set(jobId, { status: "working" });
-  // Fire and forget — do NOT await; the agent run outlives this request.
-  runDispatchAgent(task)
-    .then((result) => jobs.set(jobId, { status: "done", result }))
-    .catch((e) => jobs.set(jobId, { status: "error", error: String(e?.message || e) }));
-  res.json({ jobId });
-});
-
-app.get("/api/dispatch/:jobId", auth, (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "not_found" });
-  res.json(job);
 });
 
 app.get("/", (_req, res) => res.json({ ok: true })); // health check for the host
