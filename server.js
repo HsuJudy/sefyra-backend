@@ -20,6 +20,9 @@ const MODEL_SUGGEST = "claude-haiku-4-5";
 const MODEL_BREAKDOWN = "claude-sonnet-5";
 const MAX_TOKENS = 400; // real outputs are ~80 tokens; this only bounds a runaway
 
+// Agent Dispatch uses a strong model with web search — quality matters and it's personal use.
+const MODEL_DISPATCH = "claude-opus-5";
+const DISPATCH_MAX_TOKENS = 8000; // room for research + a full ready-to-use draft per turn
 
 // Per-install token: the app calls /register once and stores the token in the Keychain.
 const registerLimiter = rateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 5 });
@@ -120,6 +123,73 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
     const steps = (out.steps || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 6);
     res.json({ steps, remaining: q.remaining });
   } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
+});
+
+// --- Agent Dispatch (async: tap a task, an agent researches/drafts the doable part) ---
+//
+// Agent runs take 20–60s+ (a web-search tool-use loop), longer than an HTTP timeout, so we
+// don't hold the request open. POST creates a job and returns a jobId immediately; the agent
+// runs in the background; GET polls the job. NOTE: this Map is in-memory — it resets on every
+// redeploy (Railway sends SIGTERM). Fine for personal v1; a client polling across a redeploy
+// just sees a 404 and can retry.
+const jobs = new Map(); // jobId -> { status: "working"|"done"|"error", result?, error? }
+
+const DISPATCH_SYSTEM =
+  "You are a task-execution agent inside a GTD app. Given a task, do the doable part — " +
+  "research, find, or draft — and return a finished, ready-to-use result the user can act on " +
+  "in one step. Use web search when it makes the result more accurate or current. You MUST NOT " +
+  "claim to have performed any real-world action (sending, posting, buying, booking, submitting, " +
+  "paying) — you cannot take those actions. Instead, produce the finished draft or research " +
+  "result the human will act on manually. Be concise and immediately usable: lead with the " +
+  "deliverable (the draft text, the answer, the shortlist), not a description of what you did.";
+
+// Anthropic's built-in server-side web search tool (read-only; runs on Anthropic's infra).
+const DISPATCH_TOOLS = [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }];
+
+// Run the agent to completion: a server-tool loop. web_search runs server-side, so the only
+// looping we do client-side is to resume a `pause_turn` (the API's server loop hitting its
+// per-turn iteration cap). We collect the final assistant text when the turn ends.
+async function runDispatchAgent(task) {
+  const messages = [{ role: "user", content: `Task: ${task}` }];
+  let text = "";
+  for (let i = 0; i < 12; i++) { // bound continuations so a stuck run can't loop forever
+    const resp = await anthropic.messages.create({
+      model: MODEL_DISPATCH,
+      max_tokens: DISPATCH_MAX_TOKENS,
+      system: DISPATCH_SYSTEM,
+      tools: DISPATCH_TOOLS,
+      messages,
+    });
+    if (resp.stop_reason === "pause_turn") {
+      // Server hit its iteration cap mid-turn — echo the assistant turn back to resume.
+      messages.push({ role: "assistant", content: resp.content });
+      continue;
+    }
+    text = (resp.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    break;
+  }
+  return text;
+}
+
+// Modest per-install rate limit — dispatch is expensive, so cap it below the other AI routes.
+const dispatchLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, keyGenerator: (req) => req.install?.id || req.ip });
+
+app.post("/api/dispatch", auth, dispatchLimiter, (req, res) => {
+  const task = String(req.body.task || "").slice(0, 1000).trim();
+  if (!task) return res.status(400).json({ error: "task_required" });
+  const jobId = randomUUID();
+  jobs.set(jobId, { status: "working" });
+  // Fire and forget — do NOT await; the agent run outlives this request.
+  runDispatchAgent(task)
+    .then((result) => jobs.set(jobId, { status: "done", result }))
+    .catch((e) => jobs.set(jobId, { status: "error", error: String(e?.message || e) }));
+  res.json({ jobId });
+});
+
+app.get("/api/dispatch/:jobId", auth, (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "not_found" });
+  res.json(job);
 });
 
 app.get("/", (_req, res) => res.json({ ok: true })); // health check for the host
