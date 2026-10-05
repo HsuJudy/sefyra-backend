@@ -5,6 +5,7 @@ import jwt from "jsonwebtoken";
 import { randomUUID } from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { Store } from "./store.js";
+import { verifyAppleTransaction } from "./apple.js";
 
 const app = express();
 app.use(cors({ origin: false }));
@@ -23,6 +24,12 @@ const MAX_TOKENS = 400; // real outputs are ~80 tokens; this only bounds a runaw
 // Agent Dispatch uses a strong model with web search — quality matters and it's personal use.
 const MODEL_DISPATCH = "claude-opus-5";
 const DISPATCH_MAX_TOKENS = 8000; // room for research + a full ready-to-use draft per turn
+
+// Paid tier (Agent Dispatch). Fails closed: with no product ids configured, nothing verifies.
+const APP_BUNDLE_ID = process.env.APP_BUNDLE_ID || "com.judy98122.gtdapp";
+const SUBSCRIPTION_PRODUCT_IDS = (process.env.SUBSCRIPTION_PRODUCT_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+// App Review and TestFlight purchase in "Sandbox"; set APPLE_ENVIRONMENTS=Production to refuse those.
+const APPLE_ENVIRONMENTS = (process.env.APPLE_ENVIRONMENTS || "Production,Sandbox").split(",").map((s) => s.trim());
 
 // Per-install token: the app calls /register once and stores the token in the Keychain.
 const registerLimiter = rateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 5 });
@@ -53,6 +60,21 @@ app.post("/referral/claim", auth, (req, res) => {
   const r = Store.claim(req.install.id, req.body.code);
   if (!r.ok) return res.status(400).json(r);
   res.json(r);
+});
+
+// App sends the latest signed transaction (StoreKit 2 `jwsRepresentation`) after a purchase,
+// a restore, and on launch (renewals). We verify it against Apple's root and record the expiry.
+const subscriptionLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, keyGenerator: (req) => req.install?.id || req.ip });
+app.post("/subscription/verify", auth, subscriptionLimiter, (req, res) => {
+  const r = verifyAppleTransaction(req.body.jws, {
+    bundleId: APP_BUNDLE_ID, productIds: SUBSCRIPTION_PRODUCT_IDS, environments: APPLE_ENVIRONMENTS,
+  });
+  if (!r.ok) return res.status(400).json({ error: r.reason });
+  Store.setSubscription(req.install.id, {
+    originalTransactionId: String(r.tx.originalTransactionId), productId: r.tx.productId,
+    expiresAt: r.tx.expiresDate, environment: r.tx.environment,
+  });
+  res.json(Store.status(req.install.id));
 });
 
 /**
@@ -132,7 +154,7 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
 // runs in the background; GET polls the job. NOTE: this Map is in-memory — it resets on every
 // redeploy (Railway sends SIGTERM). Fine for personal v1; a client polling across a redeploy
 // just sees a 404 and can retry.
-const jobs = new Map(); // jobId -> { status: "working"|"done"|"error", result?, error? }
+const jobs = new Map(); // jobId -> { installId, status: "working"|"done"|"error", result?, error? }
 
 const DISPATCH_SYSTEM =
   "You are a task-execution agent inside a GTD app. Given a task, do the doable part — " +
@@ -174,22 +196,30 @@ async function runDispatchAgent(task) {
 // Modest per-install rate limit — dispatch is expensive, so cap it below the other AI routes.
 const dispatchLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, keyGenerator: (req) => req.install?.id || req.ip });
 
+const MAX_DISPATCH_JOBS_PER_INSTALL = 2; // running at once — each run is the expensive model
+
 app.post("/api/dispatch", auth, dispatchLimiter, (req, res) => {
+  const installId = req.install.id;
+  if (!Store.isSubscribed(installId)) return res.status(403).json({ error: "subscription_required" });
   const task = String(req.body.task || "").slice(0, 1000).trim();
   if (!task) return res.status(400).json({ error: "task_required" });
+  const running = [...jobs.values()].filter((j) => j.installId === installId && j.status === "working").length;
+  if (running >= MAX_DISPATCH_JOBS_PER_INSTALL) return res.status(429).json({ error: "too_many_running" });
   const jobId = randomUUID();
-  jobs.set(jobId, { status: "working" });
+  jobs.set(jobId, { installId, status: "working" });
   // Fire and forget — do NOT await; the agent run outlives this request.
   runDispatchAgent(task)
-    .then((result) => jobs.set(jobId, { status: "done", result }))
-    .catch((e) => jobs.set(jobId, { status: "error", error: String(e?.message || e) }));
+    .then((result) => jobs.set(jobId, { installId, status: "done", result }))
+    .catch((e) => jobs.set(jobId, { installId, status: "error", error: String(e?.message || e) }));
   res.json({ jobId });
 });
 
+// A job is only visible to the install that started it.
 app.get("/api/dispatch/:jobId", auth, (req, res) => {
   const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "not_found" });
-  res.json(job);
+  if (!job || job.installId !== req.install.id) return res.status(404).json({ error: "not_found" });
+  const { installId, ...out } = job;
+  res.json(out);
 });
 
 app.get("/", (_req, res) => res.json({ ok: true })); // health check for the host

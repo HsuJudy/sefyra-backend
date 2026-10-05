@@ -10,13 +10,13 @@ import crypto from "crypto";
 const DB_PATH = process.env.DB_PATH || "./data/db.json";
 mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
-// { installs: { [id]: Install }, codes: { [code]: id } }
-let db = { installs: {}, codes: {} };
+// { installs: { [id]: Install }, codes: { [code]: id }, subs: { [originalTransactionId]: installId } }
+let db = { installs: {}, codes: {}, subs: {} };
 if (existsSync(DB_PATH)) {
   try { db = JSON.parse(await fs.readFile(DB_PATH, "utf8")); }
   catch { /* corrupt/empty → start fresh */ }
 }
-db.installs ??= {}; db.codes ??= {};
+db.installs ??= {}; db.codes ??= {}; db.subs ??= {};
 
 let writeTimer = null;
 function persist() {
@@ -109,6 +109,24 @@ export const Store = {
     return { ok: true, ...this.status(id) };
   },
 
+  /**
+   * Record a verified App Store subscription for this install. One purchase follows the Apple ID:
+   * if another install already held it (reinstall / new phone), it moves here and the old one loses it.
+   */
+  setSubscription(id, { originalTransactionId, productId, expiresAt, environment }) {
+    const inst = this.ensure(id);
+    const prevId = db.subs[originalTransactionId];
+    if (prevId && prevId !== id && db.installs[prevId]) delete db.installs[prevId].subscription;
+    db.subs[originalTransactionId] = id;
+    inst.subscription = { originalTransactionId, productId, expiresAt, environment };
+    persist();
+  },
+
+  isSubscribed(id) {
+    const sub = db.installs[id]?.subscription;
+    return !!sub && sub.expiresAt > Date.now();
+  },
+
   status(id) {
     const inst = this.ensure(id);
     this.rollMonth(inst);
@@ -121,6 +139,8 @@ export const Store = {
       used: inst.used,
       remaining: Math.max(0, quota - inst.used),
       resetsOn: `${inst.month}-01`,
+      subscribed: this.isSubscribed(id),
+      subscriptionExpiresAt: inst.subscription?.expiresAt ?? null,
     };
   },
 };
