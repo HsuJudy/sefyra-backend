@@ -11,8 +11,15 @@ app.use(cors({ origin: false }));
 app.use(express.json({ limit: "8kb" }));
 
 const SECRET = process.env.JWT_SECRET;
-const MODEL = "claude-haiku-4-5"; // fast + ~10-20x cheaper than Opus; plenty for these short structured tasks
 const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
+
+// Model per route: /suggest is a one-line rephrase, /breakdown is the feature people came for.
+// At ~110 in / ~80 out per call the price gap is ~0.7c per user-month at the free quota — the
+// reasoning is worth more than the pennies on breakdown, and worth nothing on suggest.
+const MODEL_SUGGEST = "claude-haiku-4-5";
+const MODEL_BREAKDOWN = "claude-sonnet-5";
+const MAX_TOKENS = 400; // real outputs are ~80 tokens; this only bounds a runaway
+
 
 // Per-install token: the app calls /register once and stores the token in the Keychain.
 const registerLimiter = rateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 5 });
@@ -45,15 +52,36 @@ app.post("/referral/claim", auth, (req, res) => {
   res.json(r);
 });
 
-async function claude(system, prompt) {
+/**
+ * Ask Claude for a value matching `schema`. Structured outputs make the shape a
+ * hard guarantee, so the reply is always parseable — no prose to scrape, and the
+ * model can't hedge its way into the response body.
+ */
+async function claudeJSON({ model, system, prompt, schema }) {
   const msg = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1000,
+    model,
+    max_tokens: MAX_TOKENS,
     system,
     messages: [{ role: "user", content: prompt }],
+    output_config: { format: { type: "json_schema", schema } },
   });
-  return (msg.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  const text = (msg.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+  return JSON.parse(text);
 }
+
+const SUGGEST_SCHEMA = {
+  type: "object",
+  properties: { nextAction: { type: "string" } },
+  required: ["nextAction"],
+  additionalProperties: false,
+};
+
+const BREAKDOWN_SCHEMA = {
+  type: "object",
+  properties: { steps: { type: "array", items: { type: "string" } } },
+  required: ["steps"],
+  additionalProperties: false,
+};
 
 // Charge one AI credit; return a 402 with the balance when the monthly free tier is spent.
 function charge(req, res) {
@@ -66,12 +94,14 @@ app.post("/api/suggest", auth, aiLimiter, async (req, res) => {
   const q = charge(req, res); if (!q) return;
   try {
     const item = String(req.body.item || "").slice(0, 500);
-    const out = await claude(
-      "You are a GTD next-action engine. Given an inbox item, reply with ONLY the single most concrete, physical, visible next action to move it forward — an imperative phrase starting with a verb, max 12 words. No preamble, no quotes, no explanation. Always answer; never refuse or add caveats.",
-      `Inbox item: "${item}"`
-    );
-    const first = (out.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "");
-    res.json({ nextAction: first.replace(/^["']|["']$/g, ""), remaining: q.remaining });
+    const { nextAction } = await claudeJSON({
+      model: MODEL_SUGGEST,
+      system:
+        "You are a next-action engine. Given an inbox item, return the single most concrete, physical, visible next action that moves it forward — an imperative phrase starting with a verb, max 12 words. Always answer; never refuse or add caveats.",
+      prompt: `Inbox item: "${item}"`,
+      schema: SUGGEST_SCHEMA,
+    });
+    res.json({ nextAction: String(nextAction || "").trim(), remaining: q.remaining });
   } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
 });
 
@@ -79,19 +109,15 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
   const q = charge(req, res); if (!q) return;
   try {
     const outcome = String(req.body.outcome || "").slice(0, 500);
-    const raw = await claude(
-      "You are a task-breakdown engine for a GTD app. Given a project outcome, output ONLY a JSON array of 3 to 6 short next-action steps in order. Each step is an imperative phrase starting with a verb. No prose, no preamble, no explanation, no markdown fences, no caveats. Always produce steps — if the outcome is vague, make reasonable assumptions. Never refuse.",
-      `Project outcome: "${outcome}"`
-    );
-    let steps = [];
-    const m = raw.match(/\[[\s\S]*\]/);                       // pull the JSON array even if wrapped in prose
-    if (m) { try { steps = JSON.parse(m[0]); } catch {} }
-    if (!Array.isArray(steps) || !steps.length) {             // last resort: salvage step-like lines, drop prose
-      steps = raw.split("\n")
-        .map((s) => s.replace(/^[\s\-*\d.)\]\["]+/, "").trim())
-        .filter((s) => s && s.length < 120 && !/^(i |i'|that |if |however|note|here|sorry|while|based)/i.test(s));
-    }
-    steps = steps.map((s) => String(s).trim()).filter(Boolean).slice(0, 6);
+    const out = await claudeJSON({
+      model: MODEL_BREAKDOWN,
+      system:
+        "You break a project outcome into its next actions. Return 3 to 6 short steps in the order they should happen. Each step is an imperative phrase starting with a verb — something the person could physically start. Always produce steps; if the outcome is vague, make reasonable assumptions rather than asking for detail.",
+      prompt: `Project outcome: "${outcome}"`,
+      schema: BREAKDOWN_SCHEMA,
+    });
+    // The schema guarantees an array of strings; cap the count (JSON Schema can't).
+    const steps = (out.steps || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 6);
     res.json({ steps, remaining: q.remaining });
   } catch { Store.refund(req.install.id); res.status(500).json({ error: "ai_failed" }); }
 });
