@@ -6,6 +6,7 @@ import { randomUUID } from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { Store } from "./store.js";
 import { verifyAppleTransaction } from "./apple.js";
+import { cleanProject, cleanCandidates, dispatchPrompt, needsInfo, INTERPRET_SYSTEM, INTERPRET_SCHEMA, interpretPrompt, finalizeInterpretation } from "./context.js";
 
 const app = express();
 app.use(cors({ origin: false }));
@@ -154,7 +155,7 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
 // runs in the background; GET polls the job. NOTE: this Map is in-memory — it resets on every
 // redeploy (Railway sends SIGTERM). Fine for personal v1; a client polling across a redeploy
 // just sees a 404 and can retry.
-const jobs = new Map(); // jobId -> { installId, status: "working"|"done"|"error", result?, error? }
+const jobs = new Map(); // jobId -> { installId, status: "working"|"done"|"needs_info"|"error", result?, question?, error? }
 
 const DISPATCH_SYSTEM =
   "You are a task-execution agent inside a GTD app. Given a task, do the doable part — " +
@@ -163,7 +164,10 @@ const DISPATCH_SYSTEM =
   "claim to have performed any real-world action (sending, posting, buying, booking, submitting, " +
   "paying) — you cannot take those actions. Instead, produce the finished draft or research " +
   "result the human will act on manually. Be concise and immediately usable: lead with the " +
-  "deliverable (the draft text, the answer, the shortlist), not a description of what you did.";
+  "deliverable (the draft text, the answer, the shortlist), not a description of what you did. " +
+  "If a project is given, make the result fit it. If the task is still too thin to produce something the " +
+  "user would actually want — you would be guessing what they mean — do not guess and do not search: reply " +
+  "with exactly one line, `NEEDS_INFO: <one short question>`.";
 
 // Anthropic's built-in server-side web search tool (read-only; runs on Anthropic's infra).
 const DISPATCH_TOOLS = [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }];
@@ -171,8 +175,8 @@ const DISPATCH_TOOLS = [{ type: "web_search_20260209", name: "web_search", max_u
 // Run the agent to completion: a server-tool loop. web_search runs server-side, so the only
 // looping we do client-side is to resume a `pause_turn` (the API's server loop hitting its
 // per-turn iteration cap). We collect the final assistant text when the turn ends.
-async function runDispatchAgent(task) {
-  const messages = [{ role: "user", content: `Task: ${task}` }];
+async function runDispatchAgent(prompt) {
+  const messages = [{ role: "user", content: prompt }];
   let text = "";
   for (let i = 0; i < 12; i++) { // bound continuations so a stuck run can't loop forever
     const resp = await anthropic.messages.create({
@@ -198,6 +202,19 @@ const dispatchLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, keyGenerator: (
 
 const MAX_DISPATCH_JOBS_PER_INSTALL = 2; // running at once — each run is the expensive model
 
+// Step 1 of delegating: before any expensive work, say back what we understood. Cheap model, one call.
+// Subscribers only (it is part of Dispatch); not charged against the free monthly AI credits.
+app.post("/api/interpret", auth, aiLimiter, async (req, res) => {
+  if (!Store.isSubscribed(req.install.id)) return res.status(403).json({ error: "subscription_required" });
+  const item = String(req.body.item || "").slice(0, 500).trim();
+  if (!item) return res.status(400).json({ error: "item_required" });
+  const candidates = cleanCandidates(req.body.candidates);
+  try {
+    const raw = await claudeJSON({ model: MODEL_SUGGEST, system: INTERPRET_SYSTEM, prompt: interpretPrompt(item, candidates), schema: INTERPRET_SCHEMA });
+    res.json(finalizeInterpretation(raw, candidates));
+  } catch { res.status(500).json({ error: "ai_failed" }); }
+});
+
 app.post("/api/dispatch", auth, dispatchLimiter, (req, res) => {
   const installId = req.install.id;
   if (!Store.isSubscribed(installId)) return res.status(403).json({ error: "subscription_required" });
@@ -208,8 +225,11 @@ app.post("/api/dispatch", auth, dispatchLimiter, (req, res) => {
   const jobId = randomUUID();
   jobs.set(jobId, { installId, status: "working" });
   // Fire and forget — do NOT await; the agent run outlives this request.
-  runDispatchAgent(task)
-    .then((result) => jobs.set(jobId, { installId, status: "done", result }))
+  runDispatchAgent(dispatchPrompt(task, cleanProject(req.body.project)))
+    .then((result) => {
+      const q = needsInfo(result);
+      jobs.set(jobId, q ? { installId, status: "needs_info", question: q } : { installId, status: "done", result });
+    })
     .catch((e) => jobs.set(jobId, { installId, status: "error", error: String(e?.message || e) }));
   res.json({ jobId });
 });

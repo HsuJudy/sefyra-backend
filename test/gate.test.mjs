@@ -34,6 +34,10 @@ test("garbage purchase proof is rejected and /me says not subscribed", async () 
   assert.equal(bad.status, 400);
   assert.equal((await (await call("/me")).json()).subscribed, false);
 });
+test("unpaid install cannot use interpret either", async () => {
+  const r = await call("/api/interpret", { method: "POST", body: JSON.stringify({ item: "tiktok thing", candidates: [] }) });
+  assert.equal(r.status, 403);
+});
 test("unknown job id is a 404", async () => {
   assert.equal((await call("/api/dispatch/nope")).status, 404);
 });
