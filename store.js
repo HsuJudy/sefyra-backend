@@ -3,7 +3,7 @@
 // swap for Postgres/Redis when volume grows. On Railway, mount a volume and set
 // DB_PATH=/data/db.json so credits survive redeploys.
 import { promises as fs } from "fs";
-import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, renameSync } from "fs";
 import path from "path";
 import crypto from "crypto";
 
@@ -13,8 +13,16 @@ mkdirSync(path.dirname(DB_PATH), { recursive: true });
 // { installs: { [id]: Install }, codes: { [code]: id }, subs: { [originalTransactionId]: installId } }
 let db = { installs: {}, codes: {}, subs: {} };
 if (existsSync(DB_PATH)) {
-  try { db = JSON.parse(await fs.readFile(DB_PATH, "utf8")); }
-  catch { /* corrupt/empty → start fresh */ }
+  let parsed;
+  try { parsed = JSON.parse(await fs.readFile(DB_PATH, "utf8")); } catch { parsed = undefined; }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) db = parsed;
+  else {
+    // Unreadable or not a database. Keep the bytes (they may be recoverable) before starting empty,
+    // otherwise the next write would silently destroy every subscription, quota and referral record.
+    const keep = `${DB_PATH}.corrupt-${Date.now()}`;
+    try { renameSync(DB_PATH, keep); console.error(`db unreadable; moved to ${keep} and starting empty`); }
+    catch (e) { console.error("db unreadable and could not be set aside", e); }
+  }
 }
 db.installs ??= {}; db.codes ??= {}; db.subs ??= {};
 
@@ -46,6 +54,8 @@ function monthKey(d = new Date()) {
 export const Store = {
   BASE_QUOTA: parseInt(process.env.FREE_AI_QUOTA || "15", 10),
   PER_REFERRAL: parseInt(process.env.REFERRAL_BONUS || "15", 10),
+  /** Dispatch runs the strongest model, so subscribers get a monthly allowance (not unlimited). */
+  DISPATCH_QUOTA: parseInt(process.env.DISPATCH_MONTHLY_QUOTA || "30", 10),
 
   /** Flush pending writes immediately — call on shutdown so a redeploy never drops credits. */
   flush() {
@@ -88,6 +98,29 @@ export const Store = {
     return { ok: true, ...this.status(id) };
   },
 
+  /** One Dispatch run for a subscriber. Separate from the free monthly credits. */
+  tryConsumeDispatch(id) {
+    const inst = this.ensure(id);
+    const m = monthKey();
+    if (inst.dispatchMonth !== m) { inst.dispatchMonth = m; inst.dispatchUsed = 0; }
+    if ((inst.dispatchUsed || 0) >= this.DISPATCH_QUOTA) return { ok: false, ...this.dispatchStatus(id) };
+    inst.dispatchUsed = (inst.dispatchUsed || 0) + 1; persist();
+    return { ok: true, ...this.dispatchStatus(id) };
+  },
+
+  /** The run failed, timed out, or only asked a question — don't charge the subscriber. */
+  refundDispatch(id) {
+    const inst = db.installs[id];
+    if (inst && inst.dispatchUsed > 0) { inst.dispatchUsed -= 1; persist(); }
+  },
+
+  dispatchStatus(id) {
+    const inst = this.ensure(id);
+    const m = monthKey();
+    const used = inst.dispatchMonth === m ? inst.dispatchUsed || 0 : 0;
+    return { dispatchQuota: this.DISPATCH_QUOTA, dispatchUsed: used, dispatchRemaining: Math.max(0, this.DISPATCH_QUOTA - used), dispatchResetsOn: `${m}-01` };
+  },
+
   /** Hand a credit back when the AI call itself fails — the user shouldn't pay for our error. */
   refund(id) {
     const inst = db.installs[id];
@@ -103,6 +136,7 @@ export const Store = {
     if (!refId) return { ok: false, reason: "invalid_code" };
     if (refId === id) return { ok: false, reason: "self_referral" };
     const referrer = db.installs[refId];
+    if (!referrer) return { ok: false, reason: "invalid_code" };
     inst.referredBy = code;
     referrer.referrals += 1;
     persist();
@@ -139,6 +173,7 @@ export const Store = {
       used: inst.used,
       remaining: Math.max(0, quota - inst.used),
       resetsOn: `${inst.month}-01`,
+      ...this.dispatchStatus(id),
       subscribed: this.isSubscribed(id),
       subscriptionExpiresAt: inst.subscription?.expiresAt ?? null,
     };

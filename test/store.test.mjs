@@ -23,3 +23,22 @@ test("a purchase follows the Apple ID: reinstalling moves it to the new install"
   assert.equal(Store.isSubscribed("new-install"), true);
   assert.equal(Store.isSubscribed("a"), false);
 });
+
+test("dispatch allowance: counts, stops at the limit, refunds, resets each month", () => {
+  const q = Store.DISPATCH_QUOTA;
+  const id = "disp-1";
+  for (let i = 0; i < q; i++) assert.equal(Store.tryConsumeDispatch(id).ok, true);
+  const over = Store.tryConsumeDispatch(id);
+  assert.equal(over.ok, false);
+  assert.equal(over.dispatchRemaining, 0);
+  Store.refundDispatch(id);
+  assert.equal(Store.dispatchStatus(id).dispatchRemaining, 1);
+  assert.equal(Store.tryConsumeDispatch(id).ok, true);
+  Store.ensure(id).dispatchMonth = "2020-01"; // pretend it is last month's count
+  assert.equal(Store.dispatchStatus(id).dispatchRemaining, q);
+  assert.equal(Store.tryConsumeDispatch(id).dispatchUsed, 1);
+});
+test("refund never goes below zero", () => {
+  Store.refundDispatch("fresh-install"); Store.refundDispatch("fresh-install");
+  assert.equal(Store.dispatchStatus("fresh-install").dispatchUsed, 0);
+});

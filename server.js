@@ -6,6 +6,7 @@ import { randomUUID } from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { Store } from "./store.js";
 import { verifyAppleTransaction } from "./apple.js";
+import { JobBook } from "./jobs.js";
 import { cleanProject, cleanCandidates, dispatchPrompt, needsInfo, INTERPRET_SYSTEM, INTERPRET_SCHEMA, interpretPrompt, finalizeInterpretation } from "./context.js";
 
 const app = express();
@@ -155,7 +156,12 @@ app.post("/api/breakdown", auth, aiLimiter, async (req, res) => {
 // runs in the background; GET polls the job. NOTE: this Map is in-memory — it resets on every
 // redeploy (Railway sends SIGTERM). Fine for personal v1; a client polling across a redeploy
 // just sees a 404 and can retry.
-const jobs = new Map(); // jobId -> { installId, status: "working"|"done"|"needs_info"|"error", result?, question?, error? }
+const jobs = new JobBook(); // see jobs.js: owner-only reads, finished jobs evicted, hung jobs failed
+
+// Cost limits for the expensive agent, all changeable on the host without a code change.
+const DISPATCH_MAX_CONTINUATIONS = parseInt(process.env.DISPATCH_MAX_CONTINUATIONS || "6", 10); // rounds of server-tool loop per job
+const DISPATCH_TIMEOUT_MS = parseInt(process.env.DISPATCH_TIMEOUT_MS || "170000", 10);          // whole job; the app gives up at 180s
+const DISPATCH_MAX_SEARCHES = parseInt(process.env.DISPATCH_MAX_SEARCHES || "8", 10);           // web searches per round
 
 const DISPATCH_SYSTEM =
   "You are a task-execution agent inside a GTD app. Given a task, do the doable part — " +
@@ -170,31 +176,34 @@ const DISPATCH_SYSTEM =
   "with exactly one line, `NEEDS_INFO: <one short question>`.";
 
 // Anthropic's built-in server-side web search tool (read-only; runs on Anthropic's infra).
-const DISPATCH_TOOLS = [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }];
+const DISPATCH_TOOLS = [{ type: "web_search_20260209", name: "web_search", max_uses: DISPATCH_MAX_SEARCHES }];
 
 // Run the agent to completion: a server-tool loop. web_search runs server-side, so the only
 // looping we do client-side is to resume a `pause_turn` (the API's server loop hitting its
 // per-turn iteration cap). We collect the final assistant text when the turn ends.
 async function runDispatchAgent(prompt) {
+  const deadline = Date.now() + DISPATCH_TIMEOUT_MS;
   const messages = [{ role: "user", content: prompt }];
-  let text = "";
-  for (let i = 0; i < 12; i++) { // bound continuations so a stuck run can't loop forever
+  for (let i = 0; i < DISPATCH_MAX_CONTINUATIONS; i++) { // bound continuations so a stuck run can't loop forever
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error("timed_out");
     const resp = await anthropic.messages.create({
       model: MODEL_DISPATCH,
       max_tokens: DISPATCH_MAX_TOKENS,
       system: DISPATCH_SYSTEM,
       tools: DISPATCH_TOOLS,
       messages,
-    });
+    }, { signal: AbortSignal.timeout(left) });
     if (resp.stop_reason === "pause_turn") {
       // Server hit its iteration cap mid-turn — echo the assistant turn back to resume.
       messages.push({ role: "assistant", content: resp.content });
       continue;
     }
-    text = (resp.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-    break;
+    const text = (resp.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    if (!text) throw new Error("empty_result");
+    return text;
   }
-  return text;
+  throw new Error("round_limit"); // never reached a final answer within the round budget
 }
 
 // Modest per-install rate limit — dispatch is expensive, so cap it below the other AI routes.
@@ -220,27 +229,38 @@ app.post("/api/dispatch", auth, dispatchLimiter, (req, res) => {
   if (!Store.isSubscribed(installId)) return res.status(403).json({ error: "subscription_required" });
   const task = String(req.body.task || "").slice(0, 1000).trim();
   if (!task) return res.status(400).json({ error: "task_required" });
-  const running = [...jobs.values()].filter((j) => j.installId === installId && j.status === "working").length;
-  if (running >= MAX_DISPATCH_JOBS_PER_INSTALL) return res.status(429).json({ error: "too_many_running" });
-  const jobId = randomUUID();
-  jobs.set(jobId, { installId, status: "working" });
+  if (jobs.runningCount(installId) >= MAX_DISPATCH_JOBS_PER_INSTALL) return res.status(429).json({ error: "too_many_running" });
+  const q = Store.tryConsumeDispatch(installId); // monthly allowance; refunded below if no deliverable results
+  if (!q.ok) return res.status(429).json({ error: "dispatch_limit", remaining: 0, resetsOn: q.dispatchResetsOn });
+  const jobId = jobs.create(installId);
   // Fire and forget — do NOT await; the agent run outlives this request.
   runDispatchAgent(dispatchPrompt(task, cleanProject(req.body.project)))
     .then((result) => {
-      const q = needsInfo(result);
-      jobs.set(jobId, q ? { installId, status: "needs_info", question: q } : { installId, status: "done", result });
+      const question = needsInfo(result);
+      if (question) { if (jobs.finish(jobId, { status: "needs_info", question })) Store.refundDispatch(installId); }
+      else jobs.finish(jobId, { status: "done", result });
     })
-    .catch((e) => jobs.set(jobId, { installId, status: "error", error: String(e?.message || e) }));
-  res.json({ jobId });
+    .catch((e) => {
+      console.error("dispatch failed:", String(e?.message || e).slice(0, 200)); // detail stays in our logs, not the client
+      if (jobs.finish(jobId, { status: "error", error: /timed_out|abort|timeout/i.test(String(e?.name) + String(e?.message)) ? "timed_out" : "agent_failed" })) {
+        Store.refundDispatch(installId);
+      }
+    });
+  res.json({ jobId, remaining: q.dispatchRemaining });
 });
 
 // A job is only visible to the install that started it.
 app.get("/api/dispatch/:jobId", auth, (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  if (!job || job.installId !== req.install.id) return res.status(404).json({ error: "not_found" });
-  const { installId, ...out } = job;
-  res.json(out);
+  const job = jobs.view(req.params.jobId, req.install.id);
+  if (!job) return res.status(404).json({ error: "not_found" });
+  res.json(job);
 });
+
+// Housekeeping: drop old finished jobs; a job stuck "working" past its limit is failed and refunded.
+setInterval(() => {
+  const { timedOut } = jobs.sweep();
+  for (const id of timedOut) Store.refundDispatch(id);
+}, 60 * 1000).unref();
 
 app.get("/", (_req, res) => res.json({ ok: true })); // health check for the host
 
